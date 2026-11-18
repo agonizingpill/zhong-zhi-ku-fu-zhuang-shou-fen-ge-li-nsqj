@@ -59,3 +59,5 @@ class DistributionInput(BaseModel):
     recipient:str=Field(min_length=2,max_length=100)
     seeds:int=Field(ge=1,le=10000)
     purpose:str=Field(min_length=5,max_length=300)
+class ReviewInput(BaseModel):
+    note:str=Field(default='',max_length=300)

@@ -10,7 +10,7 @@ from .models import *
 from .schemas import *
 from .auth import current,writer,supervisor,verify,token
 from .common import pack,lock,add,audit
-from . import renewal_service as renewal,isolation_service as isolation,harvest_service as harvest,sharing_service as sharing
+from . import renewal_service as renewal,isolation_service as isolation,harvest_service as harvest,sharing_service as sharing,model_service as models
 from .middleware import Trace,Burst
 queue=redis.Redis.from_url(os.environ['REDIS_URL'],decode_responses=True)
 @asynccontextmanager
@@ -31,7 +31,10 @@ def login(d:Login,s=Depends(session)):
 def me(u=Depends(current)):return {'email':u.email,'role':u.role}
 @app.get('/archive')
 def archive(s=Depends(session),u=Depends(current)):
-    return {cls.__tablename__:[pack(x)for x in s.scalars(select(cls).order_by(cls.id))]for cls in (Accession,Lot,GerminationTest,Regeneration,Plot,Flowering,Pollination,Harvest,Distribution)}
+    data={cls.__tablename__:[pack(x)for x in s.scalars(select(cls).order_by(cls.id))]for cls in (Accession,Lot,GerminationTest,Regeneration,Plot,Flowering,Pollination,Harvest,Distribution)}
+    data['model_versions']=[models.archive_pack(x)for x in s.scalars(select(ModelVersion).order_by(ModelVersion.id))]
+    data['model_evaluations']=[models.archive_evaluation(x)for x in s.scalars(select(ModelEvaluation).order_by(ModelEvaluation.id))]
+    return data
 @app.get('/audits')
 def audits(s=Depends(session),u=Depends(current)):return [pack(x)for x in s.scalars(select(Audit).order_by(Audit.id.desc()).limit(50))]
 @app.post('/accessions')
@@ -54,10 +57,30 @@ def test(d:TestInput,s=Depends(session),u=Depends(writer)):
 def estimate(id:int,s=Depends(session),u=Depends(writer)):
     x=lock(s,GerminationTest,id)
     if x.state not in ('recorded','failed'):raise HTTPException(409,'仅新复测或失败评估可入队')
+    # 已固定版本的失败重试沿用原版本；新入队才取当前发布版。发布并发时在版本行锁上线性化：先提交的发布生效，已入队的任务不受影响。
+    if not x.model_version_id:
+        version=models.active_for_enqueue(s)
+        if not version:raise HTTPException(409,'现行活力模型缺失，无法入队估计')
+        x.model_version_id=version.id
     x.state='queued';x.error=None;s.commit()
     try:queue.rpush('seed-vitality',id)
     except Exception:x.state='failed';x.error='队列不可用，请恢复后重试';s.commit();raise HTTPException(503,x.error)
     return pack(x)
+@app.get('/model-versions')
+def model_versions(s=Depends(session),u=Depends(current)):
+    return [models.archive_pack(x)for x in s.scalars(select(ModelVersion).order_by(ModelVersion.id))]
+@app.post('/model-versions')
+def train_model(s=Depends(session),u=Depends(supervisor)):
+    x=models.train_candidate(s,u);s.commit();return x
+@app.post('/model-versions/{id}/evaluate')
+def evaluate_model(id:int,s=Depends(session),u=Depends(supervisor)):
+    x=models.re_evaluate(s,id,u);s.commit();return x
+@app.post('/model-versions/{id}/review')
+def review_model(id:int,d:ReviewInput,s=Depends(session),u=Depends(supervisor)):
+    x=models.review(s,id,u,d.note);s.commit();return x
+@app.post('/model-versions/{id}/publish')
+def publish_model(id:int,s=Depends(session),u=Depends(supervisor)):
+    x=models.publish(s,id,u);s.commit();return x
 @app.post('/regenerations')
 def regeneration(d:RegenerationInput,s=Depends(session),u=Depends(writer)):
     x=renewal.request(s,d,u);s.commit();return x
